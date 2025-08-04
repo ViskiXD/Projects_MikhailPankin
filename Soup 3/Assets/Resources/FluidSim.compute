@@ -1,0 +1,254 @@
+#pragma kernel CalculateDensities
+#pragma kernel CalculatePressureForces
+#pragma kernel CalculateViscosity
+#pragma kernel UpdatePositions
+
+// Simulation parameters
+float deltaTime;
+float gravity;
+float viscosityStrength;
+float targetDensity;
+float smoothingRadius;
+float pressureMultiplier;
+float nearPressureMultiplier;
+float collisionDamping;
+int numParticles;
+
+// Buffers
+RWStructuredBuffer<float3> Positions;
+RWStructuredBuffer<float3> Velocities;
+RWStructuredBuffer<float> Densities;
+
+// Mathematical constants
+static const float PI = 3.14159265359;
+
+// Smoothing kernel for SPH - properly initialized
+float SmoothingKernel(float3 r, float h)
+{
+    float distance = length(r);
+    if (distance >= h) return 0.0;
+    
+    float volume = PI * pow(h, 4.0) / 6.0;
+    float kernelValue = max(0.0, h * h - distance * distance) / volume;
+    return kernelValue;
+}
+
+float3 SmoothingKernelGradient(float3 r, float h)
+{
+    float distance = length(r);
+    if (distance >= h || distance <= 0.001) return float3(0.0, 0.0, 0.0);
+    
+    float volume = PI * pow(h, 4.0) / 6.0;
+    float3 gradient = -2.0 * r / volume;
+    return gradient;
+}
+
+float ViscosityKernel(float3 r, float h)
+{
+    float distance = length(r);
+    if (distance >= h) return 0.0;
+    
+    float volume = PI * pow(h, 6.0) / 4.0;
+    float kernelValue = pow(h - distance, 2.0) / volume;
+    return kernelValue;
+}
+
+float NearPressureKernel(float3 r, float h)
+{
+    float distance = length(r);
+    if (distance >= h) return 0.0;
+    
+    float volume = PI * pow(h, 5.0) / 10.0;
+    float kernelValue = pow(h - distance, 3.0) / volume;
+    return kernelValue;
+}
+
+float3 NearPressureKernelGradient(float3 r, float h)
+{
+    float distance = length(r);
+    if (distance >= h || distance <= 0.001) return float3(0.0, 0.0, 0.0);
+    
+    float volume = PI * pow(h, 5.0) / 10.0;
+    float3 normalizedR = normalize(r);
+    float3 gradient = -3.0 * pow(h - distance, 2.0) * normalizedR / volume;
+    return gradient;
+}
+
+float DensityToPressure(float density, float targetDens, float pressureMult)
+{
+    float pressure = max(0.0, (density - targetDens) * pressureMult);
+    return pressure;
+}
+
+float CalculateSharedPressure(float densityA, float densityB, float targetDens, float pressureMult)
+{
+    float pressureA = DensityToPressure(densityA, targetDens, pressureMult);
+    float pressureB = DensityToPressure(densityB, targetDens, pressureMult);
+    float sharedPressure = (pressureA + pressureB) * 0.5;
+    return sharedPressure;
+}
+
+float3 HandleBoundaryCollision(float3 position, float3 velocity, float3 center, float3 size, float damping)
+{
+    float3 newVelocity = velocity;
+    float3 halfSize = size * 0.5;
+    
+    // X boundaries
+    if (position.x < center.x - halfSize.x)
+        newVelocity.x = abs(newVelocity.x) * damping;
+    else if (position.x > center.x + halfSize.x)
+        newVelocity.x = -abs(newVelocity.x) * damping;
+    
+    // Y boundaries
+    if (position.y < center.y - halfSize.y)
+        newVelocity.y = abs(newVelocity.y) * damping;
+    else if (position.y > center.y + halfSize.y)
+        newVelocity.y = -abs(newVelocity.y) * damping;
+    
+    // Z boundaries
+    if (position.z < center.z - halfSize.z)
+        newVelocity.z = abs(newVelocity.z) * damping;
+    else if (position.z > center.z + halfSize.z)
+        newVelocity.z = -abs(newVelocity.z) * damping;
+    
+    return newVelocity;
+}
+
+float3 ClampToBounds(float3 position, float3 center, float3 size)
+{
+    float3 halfSize = size * 0.5;
+    float3 clampedPos = clamp(position, center - halfSize, center + halfSize);
+    return clampedPos;
+}
+
+[numthreads(64,1,1)]
+void CalculateDensities (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)numParticles) return;
+    
+    float3 position = Positions[id.x];
+    float density = 0.0;
+    
+    // Calculate density by summing contributions from nearby particles
+    for (uint i = 0; i < (uint)numParticles; i++)
+    {
+        if (i == id.x) continue;
+        
+        float3 offset = Positions[i] - position;
+        float distance = length(offset);
+        
+        if (distance < smoothingRadius)
+        {
+            float kernelValue = SmoothingKernel(offset, smoothingRadius);
+            density += kernelValue;
+        }
+    }
+    
+    // Ensure minimum density to prevent division by zero
+    float finalDensity = max(density, targetDensity * 0.1);
+    Densities[id.x] = finalDensity;
+}
+
+[numthreads(64,1,1)]
+void CalculatePressureForces (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)numParticles) return;
+    
+    float3 position = Positions[id.x];
+    float density = Densities[id.x];
+    float3 pressureForce = float3(0.0, 0.0, 0.0);
+    
+    // Calculate pressure forces from nearby particles
+    for (uint i = 0; i < (uint)numParticles; i++)
+    {
+        if (i == id.x) continue;
+        
+        float3 offset = Positions[i] - position;
+        float distance = length(offset);
+        
+        if (distance < smoothingRadius && distance > 0.001)
+        {
+            float otherDensity = Densities[i];
+            float sharedPressure = CalculateSharedPressure(density, otherDensity, targetDensity, pressureMultiplier);
+            
+            // Standard pressure force
+            float3 pressureGradient = SmoothingKernelGradient(offset, smoothingRadius);
+            float3 forceContribution = pressureGradient * sharedPressure / otherDensity;
+            pressureForce += forceContribution;
+        }
+    }
+    
+    // Apply forces to velocity
+    float3 acceleration = -pressureForce / density;
+    float3 currentVelocity = Velocities[id.x];
+    float3 newVelocity = currentVelocity + acceleration * deltaTime;
+    Velocities[id.x] = newVelocity;
+}
+
+[numthreads(64,1,1)]
+void CalculateViscosity (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)numParticles) return;
+    
+    float3 position = Positions[id.x];
+    float3 velocity = Velocities[id.x];
+    float density = Densities[id.x];
+    float3 viscosityForce = float3(0.0, 0.0, 0.0);
+    
+    // Calculate viscosity forces from nearby particles
+    for (uint i = 0; i < (uint)numParticles; i++)
+    {
+        if (i == id.x) continue;
+        
+        float3 offset = Positions[i] - position;
+        float distance = length(offset);
+        
+        if (distance < smoothingRadius && distance > 0.001)
+        {
+            float3 otherVelocity = Velocities[i];
+            float otherDensity = Densities[i];
+            
+            float3 velocityDiff = otherVelocity - velocity;
+            float viscosityWeight = ViscosityKernel(offset, smoothingRadius);
+            
+            float3 forceContribution = velocityDiff * viscosityWeight / otherDensity;
+            viscosityForce += forceContribution;
+        }
+    }
+    
+    // Apply viscosity
+    float3 acceleration = viscosityForce * viscosityStrength / density;
+    float3 currentVelocity = Velocities[id.x];
+    float3 newVelocity = currentVelocity + acceleration * deltaTime;
+    Velocities[id.x] = newVelocity;
+}
+
+[numthreads(64,1,1)]
+void UpdatePositions (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)numParticles) return;
+    
+    float3 position = Positions[id.x];
+    float3 velocity = Velocities[id.x];
+    
+    // Apply gravity
+    float3 gravityForce = float3(0.0, gravity, 0.0);
+    float3 newVelocity = velocity + gravityForce * deltaTime;
+    
+    // Update position
+    float3 newPosition = position + newVelocity * deltaTime;
+    
+    // Handle boundary collisions
+    float3 boundaryCenter = float3(0.0, 0.0, 0.0);
+    float3 boundarySize = float3(2.0, 2.0, 2.0);
+    
+    // Clamp position to bounds
+    float3 clampedPosition = ClampToBounds(newPosition, boundaryCenter, boundarySize);
+    
+    // Handle collision response
+    float3 finalVelocity = HandleBoundaryCollision(clampedPosition, newVelocity, boundaryCenter, boundarySize, collisionDamping);
+    
+    // Update buffers
+    Positions[id.x] = clampedPosition;
+    Velocities[id.x] = finalVelocity;
+}
